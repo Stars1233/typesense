@@ -17,6 +17,8 @@ WhisperModel::WhisperModel(whisper_context* ctx, const std::string& model_name) 
         params.language = "auto";
         params.detect_language = true;
     }
+
+    params.suppress_non_speech_tokens = true;
 }
 
 WhisperModel::~WhisperModel() {
@@ -86,6 +88,7 @@ Option<std::string> WhisperModel::transcribe(const std::string& audio_base64) {
         ss << whisper_full_get_segment_text(ctx, i);
     }
 
-    return Option<std::string>(ss.str());
+    std::string result = ss.str();
+    return Option<std::string>(StringUtils::trim(result));
 }
 

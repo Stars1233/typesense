@@ -5,12 +5,14 @@
 #include <functional>
 #include <future>
 #include <queue>
+#include "logger.h"
 
 class ThreadPool {
 public:
     explicit ThreadPool(size_t);
     template<class F, class... Args>
     decltype(auto) enqueue(F&& f, Args&&... args);
+    void log_exhaustion();
     void shutdown();
 private:
     // need to keep track of threads so we can join them
@@ -92,5 +94,13 @@ inline void ThreadPool::shutdown() {
     condition.notify_all();
     for (std::thread& worker : workers) {
         worker.join();
+    }
+}
+
+inline void ThreadPool::log_exhaustion() {
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    if(tasks.size() >= workers.size()) {
+        LOG(WARNING) << "Threadpool exhaustion detected, task_queue_len: "
+                     << tasks.size() << ", thread_pool_len: " << workers.size();
     }
 }

@@ -1252,6 +1252,11 @@ TEST_F(CollectionAllFieldsTest, DoNotIndexFieldMarkedAsNonIndex) {
     ASSERT_FALSE(res_op.ok());
     ASSERT_EQ("Field `post` is marked as a non-indexed field in the schema.", res_op.error());
 
+    // wildcard pattern should exclude non-indexed field while searching,
+    res_op = coll1->search("Amazon", {"*"}, "", {}, sort_fields, {0}, 10, 1, FREQUENCY, {false});
+    ASSERT_TRUE(res_op.ok());
+    ASSERT_EQ(1, res_op.get()["hits"].size());
+
     // try updating a document with non-indexable field
     doc["post"] = "Some post updated.";
     auto update_op = coll1->add(doc.dump(), UPDATE, "0");
@@ -1557,6 +1562,42 @@ TEST_F(CollectionAllFieldsTest, FieldNameMatchingRegexpShouldNotBeIndexed) {
     ASSERT_EQ(1, results["hits"].size());
 }
 
+TEST_F(CollectionAllFieldsTest, AutoFieldValueCoercionRemoval) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+            {"name": "store", "type": "auto", "optional": true}
+        ]
+    })"_json;
+
+
+    auto coll1 = collectionManager.create_collection(schema).get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["store"]["id"] = 123;
+
+    coll1->add(doc1.dump(), CREATE);
+
+    // string value will be coerced to integer
+    doc1["id"] = "1";
+    doc1["store"]["id"] = "124";
+    coll1->add(doc1.dump(), CREATE);
+
+    // removal should work correctly
+    coll1->remove("1");
+
+    auto results = coll1->search("*", {},
+                                 "store.id: 124", {}, {}, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 1, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 5, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true).get();
+
+    ASSERT_EQ(0, results["found"].get<size_t>());
+}
+
 TEST_F(CollectionAllFieldsTest, FieldNameMatchingRegexpShouldNotBeIndexedInNonAutoSchema) {
     std::vector<field> fields = {field("title", field_types::STRING, false),
                                  field("name.*", field_types::STRING, true, true)};
@@ -1731,5 +1772,32 @@ TEST_F(CollectionAllFieldsTest, InvalidstemValue) {
     obj_coll_op = collectionManager.create_collection(schema);
     ASSERT_FALSE(obj_coll_op.ok());
     ASSERT_EQ("The `stem` property is only allowed for string and string[] fields.", obj_coll_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, GeopointSortValue) {
+    nlohmann::json schema = R"({
+        "name": "test",
+        "fields": [
+            {"name": "geo", "type": "geopoint", "sort": false}
+        ]
+    })"_json;
+
+    auto create_op = collectionManager.create_collection(schema);
+    ASSERT_FALSE(create_op.ok());
+    ASSERT_EQ("The `sort` property of the field `geo` having `geopoint` type cannot be `false`."
+               " The sort index is used during GeoSearch.", create_op.error());
+
+    schema = R"({
+        "name": "test",
+        "fields": [
+            {"name": "geo_array", "type": "geopoint[]", "sort": false}
+        ]
+    })"_json;
+
+    create_op = collectionManager.create_collection(schema);
+    ASSERT_FALSE(create_op.ok());
+    ASSERT_EQ("The `sort` property of the field `geo_array` having `geopoint[]` type cannot be `false`."
+              " The sort index is used during GeoSearch.", create_op.error());
+
 }
 

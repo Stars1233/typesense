@@ -129,7 +129,6 @@ Option<std::string> Config::fetch_nodes_config(const std::string& path_to_nodes)
 void Config::load_config_env() {
     this->data_dir = get_env("TYPESENSE_DATA_DIR");
     this->log_dir = get_env("TYPESENSE_LOG_DIR");
-    this->analytics_dir = get_env("TYPESENSE_ANALYTICS_DIR");
     this->api_key = get_env("TYPESENSE_API_KEY");
 
     // @deprecated
@@ -250,9 +249,29 @@ void Config::load_config_env() {
         this->memory_used_max_percentage = std::stoi(get_env("TYPESENSE_MEMORY_USED_MAX_PERCENTAGE"));
     }
 
+    if(!get_env("TYPESENSE_FILTER_BY_MAX_OPS").empty()) {
+        this->filter_by_max_ops = std::stoi(get_env("TYPESENSE_FILTER_BY_MAX_OPS"));
+    }
+
     this->skip_writes = ("TRUE" == get_env("TYPESENSE_SKIP_WRITES"));
     this->enable_lazy_filter = ("TRUE" == get_env("TYPESENSE_ENABLE_LAZY_FILTER"));
     this->reset_peers_on_error = ("TRUE" == get_env("TYPESENSE_RESET_PEERS_ON_ERROR"));
+
+    if(!get_env("TYPESENSE_MAX_PER_PAGE").empty()) {
+        this->max_per_page = std::stoi(get_env("TYPESENSE_MAX_PER_PAGE"));
+    }
+
+    if(!get_env("TYPESENSE_ANALYTICS_DIR").empty()) {
+        this->analytics_dir = get_env("TYPESENSE_ANALYTICS_DIR");
+    }
+
+    if(!get_env("TYPESENSE_ANALYTICS_DB_TTL").empty()) {
+        this->analytics_db_ttl = std::stoi(get_env("TYPESENSE_ANALYTICS_DB_TTL"));
+    }
+
+    if(!get_env("TYPESENSE_ANALYTICS_MINUTE_RATE_LIMIT").empty()) {
+        this->analytics_minute_rate_limit = std::stoi(get_env("TYPESENSE_ANALYTICS_MINUTE_RATE_LIMIT"));
+    }
 }
 
 void Config::load_config_file(cmdline::parser& options) {
@@ -285,6 +304,14 @@ void Config::load_config_file(cmdline::parser& options) {
 
     if(reader.Exists("server", "analytics-dir")) {
         this->analytics_dir = reader.Get("server", "analytics-dir", "");
+    }
+
+    if(reader.Exists("server", "analytics-db-ttl")) {
+        this->analytics_db_ttl = reader.GetInteger("server", "analytics-db-ttl", 0);
+    }
+
+    if(reader.Exists("server", "analytics-minute-rate-limit")) {
+        this->analytics_minute_rate_limit = reader.GetInteger("server", "analytics-minute-rate-limit", 5);
     }
 
     if(reader.Exists("server", "api-key")) {
@@ -452,6 +479,14 @@ void Config::load_config_file(cmdline::parser& options) {
         auto reset_peers_on_error_str = reader.Get("server", "reset-peers-on-error", "false");
         this->reset_peers_on_error = (reset_peers_on_error_str == "true");
     }
+
+    if(reader.Exists("server", "max-per-page")) {
+        this->max_per_page = reader.GetInteger("server", "max-per-page", 250);
+    }
+
+    if(reader.Exists("server", "filter-by-max-ops")) {
+        this->filter_by_max_ops = (uint16_t) reader.GetInteger("server", "filter-by-max-ops", FILTER_BY_DEFAULT_OPERATIONS);
+    }
 }
 
 void Config::load_config_cmd_args(cmdline::parser& options)  {
@@ -465,6 +500,14 @@ void Config::load_config_cmd_args(cmdline::parser& options)  {
 
     if(options.exist("analytics-dir")) {
         this->analytics_dir = options.get<std::string>("analytics-dir");
+    }
+
+    if(options.exist("analytics-db-ttl")) {
+        this->analytics_db_ttl = options.get<uint32_t>("analytics-db-ttl");
+    }
+
+    if(options.exist("analytics-minute-rate-limit")) {
+        this->analytics_minute_rate_limit = options.get<uint32_t>("analytics-minute-rate-limit");
     }
 
     if(options.exist("api-key")) {
@@ -623,6 +666,15 @@ void Config::load_config_cmd_args(cmdline::parser& options)  {
 
     if(options.exist("enable-search-logging")) {
         this->enable_search_logging = options.get<bool>("enable-search-logging");
+    }
+
+    if(options.exist("max-per-page")) {
+        this->max_per_page = options.get<int>("max-per-page");
+    }
+
+    if(options.exist("filter-by-max-ops")) {
+        this->filter_by_max_ops = options.get<uint16_t>("filter-by-max-ops");
+
     }
 }
 

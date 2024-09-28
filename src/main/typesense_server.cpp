@@ -80,6 +80,7 @@ void master_server_routes() {
     server->put("/analytics/rules/:name", put_upsert_analytics_rules);
     server->del("/analytics/rules/:name", del_analytics_rules);
     server->post("/analytics/events", post_create_event);
+    server->post("/analytics/aggregate_events", post_write_analytics_to_db);
 
     // meta
     server->get("/metrics.json", get_metrics_json);
@@ -95,17 +96,13 @@ void master_server_routes() {
     server->post("/operations/cache/clear", post_clear_cache, false, false);
     server->post("/operations/db/compact", post_compact_db, false, false);
     server->post("/operations/reset_peers", post_reset_peers, false, false);
-    
+
     server->post("/conversations/models", post_conversation_model);
     server->get("/conversations/models", get_conversation_models);
     server->get("/conversations/models/:id", get_conversation_model);
+    server->put("/conversations/models/:id", put_conversation_model);
     server->del("/conversations/models/:id", del_conversation_model);
-
-    server->get("/conversations", get_conversations);
-    server->get("/conversations/:id", get_conversation);
-    server->del("/conversations/:id", del_conversation);
-    server->put("/conversations/:id", put_conversation);
-
+    
     server->get("/limits", get_rate_limits);
     server->get("/limits/active", get_active_throttles);
     server->get("/limits/exceeds", get_limit_exceed_counts);
@@ -134,6 +131,7 @@ void crash_callback(int sig, backward::StackTrace& st) {
         }
     }
 
+    log_running_queries();
     LOG(ERROR) << "Typesense " << TYPESENSE_VERSION << " is terminating abruptly.";
 }
 

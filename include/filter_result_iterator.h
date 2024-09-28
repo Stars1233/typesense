@@ -216,14 +216,22 @@ struct filter_result_t {
     constexpr uint16_t function_call_modulo = 10;
     constexpr uint16_t string_filter_ids_threshold = 3;
     constexpr uint16_t bool_filter_ids_threshold = 3;
+    constexpr uint16_t numeric_filter_ids_threshold = 3;
 #else
     constexpr uint16_t function_call_modulo = 16'384;
     constexpr uint16_t string_filter_ids_threshold = 20'000;
     constexpr uint16_t bool_filter_ids_threshold = 20'000;
+    constexpr uint16_t numeric_filter_ids_threshold = 20'000;
 #endif
 
 struct filter_result_iterator_timeout_info {
     filter_result_iterator_timeout_info(uint64_t search_begin_us, uint64_t search_stop_us);
+
+    filter_result_iterator_timeout_info(const filter_result_iterator_timeout_info& obj) {
+        function_call_counter = obj.function_call_counter;
+        search_begin_us = obj.search_begin_us;
+        search_stop_us = obj.search_stop_us;
+    }
 
     uint16_t function_call_counter = 0;
     uint64_t search_begin_us = 0;
@@ -254,21 +262,40 @@ private:
     std::vector<std::vector<posting_list_t::iterator_t>> posting_list_iterators;
     std::vector<posting_list_t*> expanded_plists;
 
-    /// Used in case of a not equals string filter.
-    /// The iterative logic to find not equals match is to return the ids that occur in between the equals match. This
-    /// might lead to returning some ids that are deleted. So we use this iterator to check and return only the ids that
-    /// exist in `index->seq_ids`.
-    id_list_t::iterator_t all_seq_ids_iter = id_list_t::iterator_t(nullptr, nullptr, nullptr, false);
+    bool is_not_equals_iterator = false;
+    uint32_t equals_iterator_id = 0;
+    bool is_equals_iterator_valid = true;
+    uint32_t last_valid_id = 0;
 
     /// Used in case of a single boolean filter matching more than `bool_filter_ids_threshold` ids.
     num_tree_t::iterator_t bool_iterator = num_tree_t::iterator_t(nullptr, NUM_COMPARATOR::EQUALS, 0);
+
+    /// Initialized in case of filter on a numeric field.
+    /// Sample filter: [10..100, 150]. Operators other than `=` and `!` can match more than one values. We get id list
+    /// iterator for each value.
+    ///
+    /// Multiple filters: Multiple values: id list iterator
+    std::vector<std::vector<id_list_t*>> id_lists;
+    std::vector<std::vector<id_list_t::iterator_t>> id_list_iterators;
+    std::vector<id_list_t*> expanded_id_lists;
+
+    /// Stores the the current seq_id of filter values.
+    std::vector<uint32_t> seq_ids;
+
+    /// Numerical filters can have `!` operator individually.
+    /// Sample filter: [>10, !15].
+    std::unordered_set<uint32_t> numerical_not_iterator_index;
+
+    /// String filter can specify prefix value match.
+    /// Sample filter: [Chris P*].
+    std::unordered_set<uint32_t> string_prefix_filter_index;
 
     bool delete_filter_node = false;
 
     std::unique_ptr<filter_result_iterator_timeout_info> timeout_info;
 
     /// Initializes the state of iterator node after it's creation.
-    void init();
+    void init(const bool& enable_lazy_evaluation = false);
 
     /// Performs AND on the subtrees of operator.
     void and_filter_iterators();
@@ -276,15 +303,17 @@ private:
     /// Performs OR on the subtrees of operator.
     void or_filter_iterators();
 
-    /// Advances all the token iterators that are at seq_id and finds the next intersection.
+    /// Advances all the token iterators that are at seq_id.
     void advance_string_filter_token_iterators();
-
-    /// Finds the first match for a filter on string field. Only used in `init()` and `reset()`. Handles `!` in string
-    /// filter.
-    void get_string_filter_first_match(const bool& field_is_array);
 
     /// Finds the next match for a filter on string field.
     void get_string_filter_next_match(const bool& field_is_array);
+
+    /// Advances all the iterators that are at seq_id.
+    void advance_numeric_filter_iterators();
+
+    /// Computes the match for a filter on numeric field.
+    void get_numeric_filter_match(const bool init = false);
 
     explicit filter_result_iterator_t(uint32_t approx_filter_ids_length);
 
@@ -293,7 +322,11 @@ private:
     void get_n_ids(const uint32_t& n, filter_result_t*& result, const bool& override_timeout = false);
 
     /// Updates `validity` of the iterator to `timed_out` if condition is met. Assumes `timeout_info` is not null.
-    inline bool is_timed_out();
+    inline bool is_timed_out(const bool& override_function_call_counter = false);
+
+    /// Advances the iterator until the doc value reaches or just overshoots id. The iterator may become invalid during
+    /// this operation.
+    void skip_to(uint32_t id);
 
 public:
     uint32_t seq_id = 0;
@@ -318,6 +351,7 @@ public:
 
     explicit filter_result_iterator_t(const std::string& collection_name,
                                       Index const* const index, filter_node_t const* const filter_node,
+                                      const bool& enable_lazy_evaluation = false,
                                       uint64_t search_begin_us = 0, uint64_t search_stop_us = UINT64_MAX);
 
     ~filter_result_iterator_t();
@@ -330,16 +364,18 @@ public:
     /// Recursively computes the result of each node and stores the final result in the root node.
     void compute_iterators();
 
-    /// Returns a tri-state:
-    ///     0: id is not valid
-    ///     1: id is valid
-    ///    -1: end of iterator / timed out
+    /// Handles moving the individual iterators to id internally and checks if `id` matches the filter.
     ///
-    ///  Handles moving the individual iterators internally.
-    [[nodiscard]] int is_valid(uint32_t id);
+    /// \return
+    /// 0 : id is not valid
+    /// 1 : id is valid
+    /// -1: end of iterator / timed out
+    [[nodiscard]] int is_valid(uint32_t id, const bool& override_timeout = false);
 
     /// Advances the iterator to get the next value of doc and reference. The iterator may become invalid during this
     /// operation.
+    ///
+    /// Should only be called after calling `compute_iterators()` or in conjunction with `is_valid(id)` when it returns `1`.
     void next();
 
     /// Collects n doc ids while advancing the iterator. The ids present in excluded_result_ids are ignored. The
@@ -349,17 +385,16 @@ public:
                    uint32_t const* const excluded_result_ids, const size_t& excluded_result_ids_size,
                    filter_result_t*& result, const bool& override_timeout = false);
 
-    /// Advances the iterator until the doc value reaches or just overshoots id. The iterator may become invalid during
-    /// this operation.
-    void skip_to(uint32_t id, const bool& override_timeout = false);
-
     /// Returns true if at least one id from the posting list object matches the filter.
     bool contains_atleast_one(const void* obj);
 
     /// Returns to the initial state of the iterator.
     void reset(const bool& override_timeout = false);
 
-    /// Iterates and collects all the filter ids into filter_array.
+    /// Copies filter ids from `filter_result` into `filter_array`.
+    ///
+    /// Should only be called after calling `compute_iterators()`.
+    ///
     /// \return size of the filter array
     uint32_t to_filter_id_array(uint32_t*& filter_array);
 
@@ -374,5 +409,25 @@ public:
 
     [[nodiscard]] bool _get_is_filter_result_initialized() const {
         return is_filter_result_initialized;
+    }
+
+    [[nodiscard]] filter_result_iterator_t* _get_left_it() const {
+        return left_it;
+    }
+
+    [[nodiscard]] filter_result_iterator_t* _get_right_it() const {
+        return right_it;
+    }
+
+    [[nodiscard]] uint32_t _get_equals_iterator_id() const {
+        return equals_iterator_id;
+    }
+
+    [[nodiscard]] bool _get_is_equals_iterator_valid() const {
+        return is_equals_iterator_valid;
+    }
+
+    inline bool is_filter_provided() const {
+        return filter_node != nullptr;
     }
 };

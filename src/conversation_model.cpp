@@ -15,7 +15,7 @@ const std::string get_model_namespace(const std::string& model_name) {
 }
 
 Option<bool> ConversationModel::validate_model(const nlohmann::json& model_config) {
-    // check model_name is exists and it is a string
+    // check model_name exists and it is a string
     if(model_config.count("model_name") == 0 || !model_config["model_name"].is_string()) {
         return Option<bool>(400, "Property `model_name` is not provided or not a string.");
     }
@@ -24,14 +24,28 @@ Option<bool> ConversationModel::validate_model(const nlohmann::json& model_confi
         return Option<bool>(400, "Property `system_prompt` is not a string.");
     }
 
+    if(model_config.count("history_collection") == 0 || !model_config["history_collection"].is_string()) {
+        return Option<bool>(400, "Property `history_collection` is missing or is not a string.");
+    }
+
     if(model_config.count("max_bytes") == 0 || !model_config["max_bytes"].is_number_unsigned() || model_config["max_bytes"].get<size_t>() == 0) {
         return Option<bool>(400, "Property `max_bytes` is not provided or not a positive integer.");
+    }
+
+    auto validate_converson_collection_op = ConversationManager::get_instance()
+            .validate_conversation_store_collection(model_config["history_collection"].get<std::string>());
+    if(!validate_converson_collection_op.ok()) {
+        return Option<bool>(400, validate_converson_collection_op.error());
+    }
+
+    if(model_config.count("ttl") != 0 && !model_config["ttl"].is_number_unsigned()) {
+        return Option<bool>(400, "Property `ttl` is not a positive integer.");
     }
 
     const std::string model_namespace = get_model_namespace(model_config["model_name"].get<std::string>());
     if(model_namespace == "openai") {
         return OpenAIConversationModel::validate_model(model_config);
-    } else if(model_namespace == "cf") {
+    } else if(model_namespace == "cloudflare") {
         return CFConversationModel::validate_model(model_config);
     } else if(model_namespace == "vllm") {
         return vLLMConversationModel::validate_model(model_config);
@@ -51,7 +65,7 @@ Option<std::string> ConversationModel::get_answer(const std::string& context, co
 
     if(model_namespace == "openai") {
         return OpenAIConversationModel::get_answer(context, prompt, system_prompt, model_config);
-    } else if(model_namespace == "cf") {
+    } else if(model_namespace == "cloudflare") {
         return CFConversationModel::get_answer(context, prompt, system_prompt, model_config);
     } else if(model_namespace == "vllm") {
         return vLLMConversationModel::get_answer(context, prompt, system_prompt, model_config);
@@ -65,7 +79,7 @@ Option<std::string> ConversationModel::get_standalone_question(const nlohmann::j
 
     if(model_namespace == "openai") {
         return OpenAIConversationModel::get_standalone_question(conversation_history, question, model_config);
-    } else if(model_namespace == "cf") {
+    } else if(model_namespace == "cloudflare") {
         return CFConversationModel::get_standalone_question(conversation_history, question, model_config);
     } else if(model_namespace == "vllm") {
         return vLLMConversationModel::get_standalone_question(conversation_history, question, model_config);
@@ -79,7 +93,7 @@ Option<nlohmann::json> ConversationModel::format_question(const std::string& mes
 
     if(model_namespace == "openai") {
         return OpenAIConversationModel::format_question(message);
-    } else if(model_namespace == "cf") {
+    } else if(model_namespace == "cloudflare") {
         return CFConversationModel::format_question(message);
     } else if(model_namespace == "vllm") {
         return vLLMConversationModel::format_question(message);
@@ -93,7 +107,7 @@ Option<nlohmann::json> ConversationModel::format_answer(const std::string& messa
 
     if(model_namespace == "openai") {
         return OpenAIConversationModel::format_answer(message);
-    } else if(model_namespace == "cf") {
+    } else if(model_namespace == "cloudflare") {
         return CFConversationModel::format_answer(message);
     } else if(model_namespace == "vllm") {
         return vLLMConversationModel::format_answer(message);
@@ -107,7 +121,7 @@ Option<size_t> ConversationModel::get_minimum_required_bytes(const nlohmann::jso
 
     if(model_namespace == "openai") {
         return Option<size_t>(OpenAIConversationModel::get_minimum_required_bytes());
-    } else if(model_namespace == "cf") {
+    } else if(model_namespace == "cloudflare") {
         return Option<size_t>(CFConversationModel::get_minimum_required_bytes());
     } else if(model_namespace == "vllm") {
         return Option<size_t>(vLLMConversationModel::get_minimum_required_bytes());
@@ -136,28 +150,27 @@ Option<bool> OpenAIConversationModel::validate_model(const nlohmann::json& model
         return Option<bool>(408, "OpenAI API timeout.");
     }
 
-    if (res_code != 200) {
-        nlohmann::json json_res;
-        try {
-            json_res = nlohmann::json::parse(res);
-        } catch (const std::exception& e) {
-            return Option<bool>(400, "OpenAI API error: " + res);
-        }
-        if(json_res.count("error") == 0 || json_res["error"].count("message") == 0) {
-            return Option<bool>(400, "OpenAI API error: " + res);
-        }
-        return Option<bool>(400, "OpenAI API error: " + nlohmann::json::parse(res)["error"]["message"].get<std::string>());
-    }
-
     nlohmann::json models_json;
+
     try {
         models_json = nlohmann::json::parse(res);
     } catch (const std::exception& e) {
-        return Option<bool>(400, "Got malformed response from OpenAI API.");
+        return Option<bool>(400, "Error parsing OpenAI API response: " + res);
     }
-    bool found = false;
+
+    if(res_code != 200) {
+        if(models_json.count("error") == 0 || models_json["error"].count("message") == 0) {
+            return Option<bool>(400, "OpenAI API error, response: " + res);
+        }
+
+        return Option<bool>(400, "OpenAI API error: " + models_json["error"]["message"].get<std::string>());
+    }
+
     // extract model name by removing "openai/" prefix
-    auto model_name_without_namespace = EmbedderManager::get_model_name_without_namespace(model_config["model_name"].get<std::string>());
+    auto model_name_without_namespace = EmbedderManager::get_model_name_without_namespace(
+                                                            model_config["model_name"].get<std::string>());
+
+    bool found = false;
     for (auto& model : models_json["data"]) {
         if (model["id"] == model_name_without_namespace) {
             found = true;
@@ -177,8 +190,8 @@ Option<bool> OpenAIConversationModel::validate_model(const nlohmann::json& model
             "content":"hello"
         }
     ])"_json;
-    std::string chat_res;
 
+    std::string chat_res;
     res_code = RemoteEmbedder::call_remote_api("POST", OPENAI_CHAT_COMPLETION, req_body.dump(), chat_res, res_headers, headers);
 
     if(res_code == 408) {
@@ -195,7 +208,7 @@ Option<bool> OpenAIConversationModel::validate_model(const nlohmann::json& model
         if(json_res.count("error") == 0 || json_res["error"].count("message") == 0) {
             return Option<bool>(400, "OpenAI API error: " + chat_res);
         }
-        return Option<bool>(400, "OpenAI API error: " + nlohmann::json::parse(res)["error"]["message"].get<std::string>());
+        return Option<bool>(400, "OpenAI API error: " + json_res["error"]["message"].get<std::string>());
     }
 
     return Option<bool>(true);
@@ -360,7 +373,7 @@ Option<nlohmann::json> OpenAIConversationModel::format_answer(const std::string&
 }
 
 const std::string CFConversationModel::get_model_url(const std::string& model_name, const std::string& account_id) {
-    return "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/@cf/" + model_name;
+    return "https://api.cloudflare.com/client/v4/accounts/" + account_id + "/ai/run/" + model_name;
 }
 
 Option<bool> CFConversationModel::validate_model(const nlohmann::json& model_config) {
@@ -383,17 +396,6 @@ Option<bool> CFConversationModel::validate_model(const nlohmann::json& model_con
     auto model_name = EmbedderManager::get_model_name_without_namespace(model_config["model_name"].get<std::string>());
 
     bool found = false;
-
-    for(auto& cf_model_name : CF_MODEL_NAMES) {
-        if(cf_model_name == model_name) {
-            found = true;
-            break;
-        }
-    }
-
-    if(!found) {
-        return Option<bool>(400, "Model name is not a valid Cloudflare model");
-    }
 
     std::unordered_map<std::string, std::string> headers;
     std::map<std::string, std::string> res_headers;
@@ -545,7 +547,7 @@ Option<std::string> CFConversationModel::get_standalone_question(const nlohmann:
     auto res_code = RemoteEmbedder::call_remote_api("POST_STREAM", url, req_body.dump(), res, res_headers, headers);
 
     if(res_code == 408) {
-        return Option<std::string>(400, "OpenAI API timeout.");
+        return Option<std::string>(400, "Cloudflare API timeout.");
     }
 
     if (res_code != 200) {
@@ -564,30 +566,7 @@ Option<std::string> CFConversationModel::get_standalone_question(const nlohmann:
         return Option<std::string>(400, "Cloudflare API error: " + json_res["message"].get<std::string>());
     }
     
-    try {
-        auto json_res = nlohmann::json::parse(res);
-        std::string parsed_response = "";
-        std::vector<std::string> lines = json_res["response"].get<std::vector<std::string>>();
-        for(auto& line : lines) {
-            while(line.find("data:") != std::string::npos) {
-                auto substr_line = line.substr(line.find("data:") + 6);
-                if(substr_line.find("[DONE]") != std::string::npos) {
-                    break;
-                }
-                nlohmann::json json_line;
-                if(substr_line.find("\n") != std::string::npos) {
-                   json_line = nlohmann::json::parse(substr_line.substr(0, substr_line.find("\n")));
-                } else {
-                    json_line = nlohmann::json::parse(substr_line);
-                }
-                parsed_response += json_line["response"];
-                line = substr_line;
-            }
-        }
-        return Option<std::string>(parsed_response);
-    } catch (const std::exception& e) {
-        return Option<std::string>(400, "Got malformed response from Cloudflare API.");
-    }
+    return parse_stream_response(res);
 }
 
 Option<nlohmann::json> CFConversationModel::format_question(const std::string& message) {
@@ -637,10 +616,19 @@ Option<bool> vLLMConversationModel::validate_model(const nlohmann::json& model_c
     if(!model_config["vllm_url"].is_string()) {
         return Option<bool>(400, "vLLM URL is not a string");
     }
+
     
     std::unordered_map<std::string, std::string> headers;
     std::map<std::string, std::string> res_headers;
     std::string res;
+
+    if(model_config.count("api_key") != 0) {
+        if(!model_config["api_key"].is_string()) {
+            return Option<bool>(400, "API key is not a string");
+        }
+        headers["Authorization"] = "Bearer " + model_config["api_key"].get<std::string>();
+    }
+
     auto res_code = RemoteEmbedder::call_remote_api("GET", get_list_models_url(model_config["vllm_url"]), "", res, res_headers, headers);
 
     if(res_code == 408) {
@@ -738,6 +726,11 @@ Option<std::string> vLLMConversationModel::get_answer(const std::string& context
     req_body["messages"].push_back(message);
 
     std::string res;
+
+    if(model_config.count("api_key") != 0) {
+        headers["Authorization"] = "Bearer " + model_config["api_key"].get<std::string>();
+    }
+
     auto res_code = RemoteEmbedder::call_remote_api("POST", get_chat_completion_url(vllm_url), req_body.dump(), res, res_headers, headers);
 
     if(res_code == 408) {
@@ -819,6 +812,10 @@ Option<std::string> vLLMConversationModel::get_standalone_question(const nlohman
     message["content"] = standalone_question;
 
     req_body["messages"].push_back(message);
+
+    if(model_config.count("api_key") != 0) {
+        headers["Authorization"] = "Bearer " + model_config["api_key"].get<std::string>();
+    }
 
     auto res_code = RemoteEmbedder::call_remote_api("POST", get_chat_completion_url(vllm_url), req_body.dump(), res, res_headers, headers);
 

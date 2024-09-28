@@ -5,8 +5,14 @@
 #include "filter.h"
 
 Option<bool> filter::validate_numerical_filter_value(field _field, const string &raw_value) {
-    if(_field.is_int32() && !StringUtils::is_int32_t(raw_value)) {
-        return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not an int32.");
+    if(_field.is_int32()) {
+        if (!StringUtils::is_integer(raw_value)) {
+            return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not an int32.");
+        } else if (!StringUtils::is_int32_t(raw_value)) {
+            return Option<bool>(400, "Error with filter field `" + _field.name +
+                                                        "`: `" + raw_value + "` exceeds the range of an int32.");
+        }
+        return Option<bool>(true);
     }
 
     else if(_field.is_int64() && !StringUtils::is_int64_t(raw_value)) {
@@ -47,6 +53,8 @@ Option<NUM_COMPARATOR> filter::extract_num_comparator(string &comp_and_value) {
     else if(comp_and_value.compare(0, 1, ">") == 0) {
         num_comparator = GREATER_THAN;
     }
+
+    // "=" case is handled upstream.
 
     else if(comp_and_value.find("..") != std::string::npos) {
         num_comparator = RANGE_INCLUSIVE;
@@ -453,6 +461,10 @@ Option<bool> toFilter(const std::string expression,
         } else {
             std::vector<std::string> doc_ids;
             StringUtils::split_to_values(raw_value, doc_ids); // to handle backticks
+            if (doc_ids.empty()) {
+                return Option<bool>(400, empty_filter_err);
+            }
+
             std::string seq_id_str;
             StoreStatus seq_id_status = store->get(doc_id_prefix + doc_ids[0], seq_id_str);
             if (seq_id_status == StoreStatus::FOUND) {
@@ -629,14 +641,20 @@ Option<bool> toFilter(const std::string expression,
             std::vector<std::string> filter_values;
             StringUtils::split_to_values(
                     raw_value.substr(filter_value_index + 1, raw_value.size() - filter_value_index - 2), filter_values);
-            if (filter_values.empty()) {
-                return Option<bool>(400, "Error with filter field `" + _field.name +
-                                         "`: Filter value array cannot be empty.");
+            if(_field.stem) {
+                auto stemmer = _field.get_stemmer();
+                for (std::string& filter_value: filter_values) {
+                    filter_value = stemmer->stem(filter_value);
+                }
             }
-
             filter_exp = {field_name, filter_values, {str_comparator}};
         } else {
-            filter_exp = {field_name, {raw_value.substr(filter_value_index)}, {str_comparator}};
+            std::string filter_value = raw_value.substr(filter_value_index);
+            if(_field.stem) {
+                auto stemmer = _field.get_stemmer();
+                filter_value = stemmer->stem(filter_value);
+            }
+            filter_exp = {field_name, {filter_value}, {str_comparator}};
         }
 
         filter_exp.apply_not_equals = apply_not_equals;
@@ -759,8 +777,9 @@ Option<bool> filter::parse_filter_query(const std::string& filter_query,
         return toPostfix_op;
     }
 
-    if (postfix.size() > 100) {
-        return Option<bool>(400, "`filter_by` has too many operations.");
+    auto const& max_ops = CollectionManager::get_instance().filter_by_max_ops;
+    if (postfix.size() > max_ops) {
+        return Option<bool>(400, "`filter_by` has too many operations. Maximum allowed: " + std::to_string(max_ops));
     }
 
     Option<bool> toParseTree_op = toParseTree(postfix,

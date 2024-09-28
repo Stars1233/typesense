@@ -4,7 +4,8 @@
 #include <mutex>
 #include "string_utils.h"
 
-QueryAnalytics::QueryAnalytics(size_t k) : k(k), max_size(k * 2) {
+QueryAnalytics::QueryAnalytics(size_t k, bool enable_auto_aggregation)
+                : k(k), max_size(k * 2), auto_aggregation_enabled(enable_auto_aggregation) {
 
 }
 
@@ -26,7 +27,9 @@ void QueryAnalytics::add(const std::string& key, const std::string& expanded_key
         if(queries.size() < 100) {
             // only live queries could send expanded queries
             const std::string& actual_key = expand_query ? expanded_key : key;
-            queries.emplace_back(actual_key, now_ts_us);
+            if(actual_key.size() < max_query_length) {
+                queries.emplace_back(actual_key, now_ts_us);
+            }
         }
 
         umutex.unlock();
@@ -41,7 +44,7 @@ void QueryAnalytics::add(const std::string& key, const std::string& expanded_key
 
         if(it != local_counts.end()) {
             it.value()++;
-        } else if(local_counts.size() < max_size) {
+        } else if(local_counts.size() < max_size && key.size() < max_query_length) {
             // skip count when map has become too large (to prevent abuse)
             local_counts.emplace(key, 1);
         }
@@ -122,4 +125,8 @@ tsl::htrie_map<char, uint32_t> QueryAnalytics::get_local_counts() {
 
 void QueryAnalytics::set_expand_query(bool expand_query) {
     this->expand_query = expand_query;
+}
+
+bool QueryAnalytics::is_auto_aggregation_enabled() const {
+    return auto_aggregation_enabled;
 }

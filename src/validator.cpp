@@ -62,6 +62,10 @@ Option<uint32_t> validator_t::coerce_element(const field& a_field, nlohmann::jso
             }
         }
     } else if(a_field.is_array()) {
+        if (doc_ele.is_null()) {
+            doc_ele = nlohmann::json::array();
+        }
+
         if(!doc_ele.is_array()) {
             bool is_auto_embedding = a_field.type == field_types::FLOAT_ARRAY && a_field.embed.count(fields::from) > 0;
             if((a_field.optional && (dirty_values == DIRTY_VALUES::DROP ||
@@ -653,7 +657,7 @@ Option<uint32_t> validator_t::validate_index_in_memory(nlohmann::json& document,
 
         bool is_auto_embedding = a_field.type == field_types::FLOAT_ARRAY && a_field.embed.count(fields::from) > 0;
 
-        if(document.count(field_name) == 0 && !is_auto_embedding) {
+        if(document.count(field_name) == 0 && !is_auto_embedding && a_field.store) {
             return Option<>(400, "Field `" + field_name  + "` has been declared in the schema, "
                                                            "but is not found in the document.");
         }
@@ -719,13 +723,18 @@ Option<bool> validator_t::validate_embed_fields(const nlohmann::json& document,
             if(schema_field_it == search_schema.end()) {
                 return Option<bool>(400, "Field `" + field.name + "` has invalid fields to create embeddings from.");
             }
-            if(doc_field_it == document.end()) {
+            if(doc_field_it == document.end() || doc_field_it.value().is_null()) {
                 if(!is_update && !schema_field_it->optional) {
                     return Option<bool>(400, "Field `" + field_name + "` is needed to create embedding.");
                 } else {
                     continue;
                 }
             }
+
+            if(doc_field_it.value().is_null()) {
+                continue;
+            }
+
             all_optional_and_null = false;
             if((schema_field_it.value().type == field_types::STRING && !doc_field_it.value().is_string()) || 
                 (schema_field_it.value().type == field_types::STRING_ARRAY && !doc_field_it.value().is_array())) {

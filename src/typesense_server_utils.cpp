@@ -20,11 +20,9 @@
 #include "ratelimit_manager.h"
 #include "embedder_manager.h"
 #include "typesense_server_utils.h"
-#include "file_utils.h"
 #include "threadpool.h"
 #include "stopwords_manager.h"
 #include "conversation_manager.h"
-#include "conversation_model_manager.h"
 #include "vq_model_manager.h"
 
 #ifndef ASAN_BUILD
@@ -68,6 +66,9 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<std::string>("search-only-api-key", 's', "[DEPRECATED: use API key management end-point] API key that allows only searches.", false);
     options.add<std::string>("health-rusage-api-key", '\0', "API key that allows access to health end-point with resource usage.", false);
     options.add<std::string>("analytics-dir", '\0', "Directory where Analytics will be stored.", false);
+    options.add<uint32_t>("analytics-db-ttl", '\0', "TTL in seconds for events stored in analytics db", false);
+    options.add<uint32_t>("analytics-minute-rate-limit", '\0', "per minute rate limit for /events endpoint", false);
+
 
     options.add<std::string>("api-address", '\0', "Address to which Typesense API service binds.", false, "0.0.0.0");
     options.add<uint32_t>("api-port", '\0', "Port on which Typesense API service listens.", false, 8108);
@@ -114,6 +115,9 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<uint32_t>("housekeeping-interval", '\0', "Frequency of housekeeping background job (in seconds).", false, 1800);
     options.add<bool>("enable-lazy-filter", '\0', "Filter clause will be evaluated lazily.", false, false);
     options.add<uint32_t>("db-compaction-interval", '\0', "Frequency of RocksDB compaction (in seconds).", false, 604800);
+    options.add<uint16_t>("filter-by-max-ops", '\0', "Maximum number of operations permitted in filtery_by.", false, Config::FILTER_BY_DEFAULT_OPERATIONS);
+
+    options.add<int>("max-per-page", '\0', "Max number of hits per page", false, 250);
 
     // DEPRECATED
     options.add<std::string>("listen-address", 'h', "[DEPRECATED: use `api-address`] Address to which Typesense API service binds.", false, "0.0.0.0");
@@ -234,7 +238,8 @@ const char* get_internal_ip(const std::string& subnet_cidr) {
     return "127.0.0.1";
 }
 
-int start_raft_server(ReplicationState& replication_state, const std::string& state_dir, const std::string& path_to_nodes,
+int start_raft_server(ReplicationState& replication_state, Store& store,
+                      const std::string& state_dir, const std::string& path_to_nodes,
                       const std::string& peering_address, uint32_t peering_port, const std::string& peering_subnet,
                       uint32_t api_port, int snapshot_interval_seconds, int snapshot_max_byte_count_per_rpc,
                       const std::atomic<bool>& reset_peers_on_error) {
@@ -365,6 +370,15 @@ int run_server(const Config & config, const std::string & version, void (*master
         return 1;
     }
 
+    if (config.get_enable_search_analytics() && !config.get_analytics_dir().empty() &&
+        !directory_exists(config.get_analytics_dir())) {
+        LOG(INFO) << "Analytics directory " << config.get_analytics_dir() << " does not exist, will create it...";
+        if(!create_directory(config.get_analytics_dir())) {
+            LOG(ERROR) << "Could not create analytics directory. Quitting.";
+            return 1;
+        }
+    }
+
     if(!config.get_master().empty()) {
         LOG(ERROR) << "The --master option has been deprecated. Please use clustering for high availability. "
                    << "Look for the --nodes configuration in the documentation.";
@@ -382,6 +396,8 @@ int run_server(const Config & config, const std::string & version, void (*master
     std::string state_dir = config.get_data_dir() + "/state";
     std::string meta_dir = config.get_data_dir() + "/meta";
     std::string analytics_dir = config.get_analytics_dir();
+    int32_t analytics_db_ttl = config.get_analytics_db_ttl();
+    uint32_t analytics_minute_rate_limit = config.get_analytics_minute_rate_limit();
 
     size_t thread_pool_size = config.get_thread_pool_size();
 
@@ -403,14 +419,16 @@ int run_server(const Config & config, const std::string & version, void (*master
     // meta DB for storing house keeping things
     Store meta_store(meta_dir, 24*60*60, 1024, false);
 
-    //analytics DB for storing query click events
-    std::unique_ptr<Store> analytics_store = nullptr;
+    Store* analytics_store = nullptr;
+    if(!analytics_dir.empty()) {
+        //analytics DB for storing analytics events
+        analytics_store = new Store(analytics_dir, 24*60*60, 1024, true, analytics_db_ttl);
+        AnalyticsManager::get_instance().init(&store, analytics_store, analytics_minute_rate_limit);
+    }
 
     curl_global_init(CURL_GLOBAL_SSL);
     HttpClient & httpClient = HttpClient::get_instance();
     httpClient.init(config.get_api_key());
-
-    AnalyticsManager::get_instance().init(&store, analytics_dir);
 
     server = new HttpServer(
         version,
@@ -437,7 +455,7 @@ int run_server(const Config & config, const std::string & version, void (*master
 
     CollectionManager & collectionManager = CollectionManager::get_instance();
     collectionManager.init(&store, &app_thread_pool, config.get_max_memory_ratio(),
-                           config.get_api_key(), quit_raft_service);
+                           config.get_api_key(), quit_raft_service, config.get_filter_by_max_ops());
 
     StopwordsManager& stopwordsManager = StopwordsManager::get_instance();
     stopwordsManager.init(&store);
@@ -448,34 +466,25 @@ int run_server(const Config & config, const std::string & version, void (*master
     if(!rate_limit_manager_init.ok()) {
         LOG(INFO) << "Failed to initialize rate limit manager: " << rate_limit_manager_init.error();
     }
+
     EmbedderManager::set_model_dir(config.get_data_dir() + "/models");
-
-    auto conversations_init = ConversationManager::get_instance().init(&store);
-
-    if(!conversations_init.ok()) {
-        LOG(INFO) << "Failed to initialize conversation manager: " << conversations_init.error();
-    } else {
-        LOG(INFO) << "Loaded " << conversations_init.get() << "(s) conversations.";
-    }
-
-    auto conversation_models_init = ConversationModelManager::init(&store);
-
-    if(!conversation_models_init.ok()) {
-        LOG(INFO) << "Failed to initialize conversation model manager: " << conversation_models_init.error();
-    } else {
-        LOG(INFO) << "Loaded " << conversation_models_init.get() << "(s) conversation models.";
-    }
 
     // first we start the peering service
 
-    ReplicationState replication_state(server, batch_indexer, &store, analytics_store.get(),
+    ReplicationState replication_state(server, batch_indexer, &store, analytics_store,
                                        &replication_thread_pool, server->get_message_dispatcher(),
                                        ssl_enabled,
                                        &config,
                                        num_collections_parallel_load,
                                        config.get_num_documents_parallel_load());
 
-    std::thread raft_thread([&replication_state, &config, &state_dir,
+    auto conversations_init = ConversationManager::get_instance().init(&replication_state);
+
+    if(!conversations_init.ok()) {
+        LOG(INFO) << "Failed to initialize conversation manager: " << conversations_init.error();
+    }
+
+    std::thread raft_thread([&replication_state, &store, &config, &state_dir,
                              &app_thread_pool, &server_thread_pool, &replication_thread_pool, batch_indexer]() {
 
         std::thread batch_indexing_thread([batch_indexer]() {
@@ -499,7 +508,7 @@ int run_server(const Config & config, const std::string & version, void (*master
         RemoteEmbedder::init(&replication_state);
 
         std::string path_to_nodes = config.get_nodes();
-        start_raft_server(replication_state, state_dir, path_to_nodes,
+        start_raft_server(replication_state, store, state_dir, path_to_nodes,
                           config.get_peering_address(),
                           config.get_peering_port(),
                           config.get_peering_subnet(),
@@ -573,6 +582,8 @@ int run_server(const Config & config, const std::string & version, void (*master
     VQModelManager::get_instance().delete_all_models();
 
     CollectionManager::get_instance().dispose();
+
+    delete analytics_store;
 
     LOG(INFO) << "Bye.";
 

@@ -135,7 +135,7 @@ Option<bool> VectorQueryOps::parse_vector_query_str(const std::string& vector_qu
                     }
 
                     for(auto& fvalue: document[vector_query.field_name]) {
-                        if(!fvalue.is_number_float()) {
+                        if(!fvalue.is_number()) {
                             return Option<bool>(400, "Document referenced in vector query does not contain a valid "
                                                      "vector field.");
                         }
@@ -165,12 +165,21 @@ Option<bool> VectorQueryOps::parse_vector_query_str(const std::string& vector_qu
                 }
 
                 if(param_kv[0] == "distance_threshold") {
-                    if(!StringUtils::is_float(param_kv[1]) || std::stof(param_kv[1]) < 0.0 || std::stof(param_kv[1]) > 2.0) {
+                    auto search_schema = const_cast<Collection*>(coll)->get_schema();
+                    auto vector_field_it = search_schema.find(vector_query.field_name);
+
+                    if(!StringUtils::is_float(param_kv[1])) {
+                        return Option<bool>(400, "Malformed vector query string: "
+                                                 "`distance_threshold` parameter must be a float.");
+                    }
+
+                    auto distance_threshold = std::stof(param_kv[1]);
+                    if(vector_field_it->vec_dist == cosine && (distance_threshold < 0.0 || distance_threshold > 2.0)) {
                         return Option<bool>(400, "Malformed vector query string: "
                                                  "`distance_threshold` parameter must be a float between 0.0-2.0.");
                     }
 
-                    vector_query.distance_threshold = std::stof(param_kv[1]);
+                    vector_query.distance_threshold = distance_threshold;
                 }
 
                 if(param_kv[0] == "alpha") {

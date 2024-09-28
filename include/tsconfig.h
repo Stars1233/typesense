@@ -12,7 +12,8 @@ private:
     std::string data_dir;
     std::string log_dir;
     std::string analytics_dir;
-
+    int32_t analytics_db_ttl = 2419200; //four weeks in secs
+    uint32_t analytics_minute_rate_limit = 5;
     std::string api_key;
 
     // @deprecated
@@ -80,6 +81,10 @@ private:
 
     bool enable_search_logging;
 
+    uint32_t max_per_page;
+  
+    uint16_t filter_by_max_ops;
+
 protected:
 
     Config() {
@@ -113,6 +118,10 @@ protected:
         this->enable_lazy_filter = false;
 
         this->enable_search_logging = false;
+      
+        this->max_per_page = 250;
+
+        this->filter_by_max_ops = FILTER_BY_DEFAULT_OPERATIONS;
     }
 
     Config(Config const&) {
@@ -120,6 +129,8 @@ protected:
     }
 
 public:
+
+    static constexpr uint16_t FILTER_BY_DEFAULT_OPERATIONS = 100;
 
     static Config & get_instance() {
         static Config instance;
@@ -140,6 +151,14 @@ public:
 
     void set_analytics_dir(const std::string& analytics_dir) {
         this->analytics_dir = analytics_dir;
+    }
+
+    void set_analytics_db_ttl(int32_t analytics_db_ttl) {
+        this->analytics_db_ttl = analytics_db_ttl;
+    }
+
+    void set_analytics_minute_rate_limit(int32_t analytics_minute_rate_limit) {
+        this->analytics_minute_rate_limit = analytics_minute_rate_limit;
     }
 
     void set_api_key(const std::string & api_key) {
@@ -203,6 +222,10 @@ public:
         this->reset_peers_on_error = reset_peers_on_error;
     }
 
+    void set_max_per_page(int max_per_page) {
+        this->max_per_page = max_per_page;
+    }
+
     // getters
 
     std::string get_data_dir() const {
@@ -215,6 +238,13 @@ public:
 
     std::string get_analytics_dir() const {
         return this->analytics_dir;
+    }
+
+    int32_t get_analytics_db_ttl() const {
+        return this->analytics_db_ttl;
+    }
+    int32_t get_analytics_minute_rate_limit() const {
+        return this->analytics_minute_rate_limit;
     }
 
     std::string get_api_key() const {
@@ -376,6 +406,14 @@ public:
 
     const std::atomic<bool>& get_skip_writes() const {
         return skip_writes;
+    }
+
+    int get_max_per_page() const {
+        return this->max_per_page;
+    }
+
+    uint16_t get_filter_by_max_ops() const {
+        return filter_by_max_ops;
     }
 
     // loaders

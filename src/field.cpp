@@ -81,6 +81,18 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         field_json[fields::reference] = "";
     }
 
+    if (field_json.count(fields::async_reference) == 0) {
+        field_json[fields::async_reference] = false;
+    } else if (!field_json.at(fields::async_reference).is_boolean()) {
+        return Option<bool>(400, std::string("The `async_reference` property of the field `") +
+                                 field_json[fields::name].get<std::string>() + std::string("` should be a boolean."));
+    } else if (field_json[fields::async_reference].get<bool>() &&
+                field_json[fields::reference].get<std::string>().empty()) {
+        return Option<bool>(400, std::string("The `async_reference` property of the field `") +
+                                 field_json[fields::name].get<std::string>() + std::string("` is only applicable if "
+                                                                                           "`reference` is specified."));
+    }
+
     if(field_json.count(fields::stem) != 0) {
         if(!field_json.at(fields::stem).is_boolean()) {
             return Option<bool>(400, std::string("The `stem` property of the field `") +
@@ -208,6 +220,11 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         } else {
             field_json[fields::sort] = false;
         }
+    } else if (!field_json[fields::sort].get<bool>() &&
+                (field_json["type"] == field_types::GEOPOINT || field_json["type"] == field_types::GEOPOINT_ARRAY)) {
+        return Option<bool>(400, std::string("The `sort` property of the field `") +=
+                                 field_json[fields::name].get<std::string>() += "` having `" + field_json["type"].get<std::string>() +=
+                                 "` type cannot be `false`. The sort index is used during GeoSearch.");
     }
 
     if(field_json.count(fields::infix) == 0) {
@@ -406,7 +423,8 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
                   field_json[fields::sort], field_json[fields::infix], field_json[fields::nested],
                   field_json[fields::nested_array], field_json[fields::num_dim], vec_dist,
                   field_json[fields::reference], field_json[fields::embed], field_json[fields::range_index], 
-                  field_json[fields::store], field_json[fields::stem], field_json[fields::hnsw_params])
+                  field_json[fields::store], field_json[fields::stem], field_json[fields::hnsw_params],
+                  field_json[fields::async_reference])
     );
 
     if (!field_json[fields::reference].get<std::string>().empty()) {
@@ -566,7 +584,11 @@ Option<bool> field::flatten_field(nlohmann::json& doc, nlohmann::json& obj, cons
 
               (detected_type == field_types::FLOAT_ARRAY && the_field.type == field_types::GEOPOINT_ARRAY) ||
 
-              (detected_type == field_types::FLOAT_ARRAY && the_field.type == field_types::GEOPOINT && !has_obj_array)
+              (detected_type == field_types::FLOAT_ARRAY && the_field.type == field_types::GEOPOINT && !has_obj_array) ||
+
+              (detected_type == field_types::INT64_ARRAY && the_field.type == field_types::GEOPOINT && !has_obj_array) ||
+
+              (detected_type == field_types::INT64_ARRAY && the_field.type == field_types::GEOPOINT_ARRAY)
            );
 
         if(detected_type == the_field.type || is_numericaly_valid) {
@@ -737,27 +759,10 @@ Option<bool> field::validate_and_init_embed_field(const tsl::htrie_map<char, fie
             } else if (embed_field2->type != field_types::STRING && embed_field2->type != field_types::STRING_ARRAY && embed_field2->type != field_types::IMAGE) {
                 return Option<bool>(400, err_msg);
             }
-            if(embed_field2->type == field_types::IMAGE) {
-                if(found_image_field) {
-                    return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
-                }
-                if(field_json[fields::embed][fields::from].get<std::vector<std::string>>().size() > 1) {
-                    return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
-                }
-                found_image_field = true;
-            }
         } else if((*embed_field)[fields::type] != field_types::STRING &&
                   (*embed_field)[fields::type] != field_types::STRING_ARRAY &&
                     (*embed_field)[fields::type] != field_types::IMAGE) {
             return Option<bool>(400, err_msg);
-        } else if((*embed_field)[fields::type] == field_types::IMAGE) {
-            if(found_image_field) {
-                return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
-            }
-            if(field_json[fields::embed][fields::from].get<std::vector<std::string>>().size() > 1) {
-                return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
-            }
-            found_image_field = true;
         }
     }
 
@@ -771,6 +776,133 @@ Option<bool> field::validate_and_init_embed_field(const tsl::htrie_map<char, fie
     LOG(INFO) << "Model init done.";
     field_json[fields::num_dim] = num_dim;
     the_field.num_dim = num_dim;
+
+    return Option<bool>(true);
+}
+
+Option<bool> field::fields_to_json_fields(const std::vector<field>& fields, const string& default_sorting_field,
+                                          nlohmann::json& fields_json) {
+    bool found_default_sorting_field = false;
+
+    // Check for duplicates in field names
+    std::map<std::string, std::vector<const field*>> unique_fields;
+
+    for(const field & field: fields) {
+        unique_fields[field.name].push_back(&field);
+
+        if(field.name == "id") {
+            continue;
+        }
+
+        nlohmann::json field_val;
+        field_val[fields::name] = field.name;
+        field_val[fields::type] = field.type;
+        field_val[fields::facet] = field.facet;
+        field_val[fields::optional] = field.optional;
+        field_val[fields::index] = field.index;
+        field_val[fields::sort] = field.sort;
+        field_val[fields::infix] = field.infix;
+
+        field_val[fields::locale] = field.locale;
+
+        field_val[fields::store] = field.store;
+        field_val[fields::stem] = field.stem;
+        field_val[fields::range_index] = field.range_index;
+
+        if(field.embed.count(fields::from) != 0) {
+            field_val[fields::embed] = field.embed;
+        }
+
+        field_val[fields::nested] = field.nested;
+        if(field.nested) {
+            field_val[fields::nested_array] = field.nested_array;
+        }
+
+        if(field.num_dim > 0) {
+            field_val[fields::num_dim] = field.num_dim;
+            field_val[fields::vec_dist] = field.vec_dist == ip ? "ip" : "cosine";
+        }
+
+        if (!field.reference.empty()) {
+            field_val[fields::reference] = field.reference;
+            field_val[fields::async_reference] = field.is_async_reference;
+        }
+
+        fields_json.push_back(field_val);
+
+        if(!field.has_valid_type()) {
+            return Option<bool>(400, "Field `" + field.name +
+                                     "` has an invalid data type `" + field.type +
+                                     "`, see docs for supported data types.");
+        }
+
+        if(field.name == default_sorting_field && !field.is_sortable()) {
+            return Option<bool>(400, "Default sorting field `" + default_sorting_field +
+                                     "` is not a sortable type.");
+        }
+
+        if(field.name == default_sorting_field) {
+            if(field.optional) {
+                return Option<bool>(400, "Default sorting field `" + default_sorting_field +
+                                         "` cannot be an optional field.");
+            }
+
+            if(field.is_geopoint()) {
+                return Option<bool>(400, "Default sorting field cannot be of type geopoint.");
+            }
+
+            found_default_sorting_field = true;
+        }
+
+        if(field.is_dynamic() && !field.nested && !field.optional) {
+            return Option<bool>(400, "Field `" + field.name + "` must be an optional field.");
+        }
+
+        if(field.name == ".*" && !field.index) {
+            return Option<bool>(400, "Field `" + field.name + "` cannot be marked as non-indexable.");
+        }
+
+        if(!field.index && field.facet) {
+            return Option<bool>(400, "Field `" + field.name + "` cannot be a facet since "
+                                                              "it's marked as non-indexable.");
+        }
+
+        if(!field.is_sort_field() && field.sort) {
+            return Option<bool>(400, "Field `" + field.name + "` cannot be a sortable field.");
+        }
+    }
+
+    if(!default_sorting_field.empty() && !found_default_sorting_field) {
+        return Option<bool>(400, "Default sorting field is defined as `" + default_sorting_field +
+                                 "` but is not found in the schema.");
+    }
+
+    // check for duplicate field names in schema
+    for(auto& fname_fields: unique_fields) {
+        if(fname_fields.second.size() > 1) {
+            // if there are more than 1 field with the same field name, then
+            // a) only 1 field can be of static type
+            // b) only 1 field can be of dynamic type
+            size_t num_static = 0;
+            size_t num_dynamic = 0;
+
+            for(const field* f: fname_fields.second) {
+                if(f->name == ".*" || f->is_dynamic()) {
+                    num_dynamic++;
+                } else {
+                    num_static++;
+                }
+            }
+
+            if(num_static != 0 && num_static > 1) {
+                return Option<bool>(400, "There are duplicate field names in the schema.");
+            }
+
+            if(num_dynamic != 0 && num_dynamic > 1) {
+                return Option<bool>(400, "There are duplicate field names in the schema.");
+            }
+        }
+    }
 
     return Option<bool>(true);
 }

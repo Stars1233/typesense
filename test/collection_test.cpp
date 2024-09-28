@@ -1192,7 +1192,9 @@ TEST_F(CollectionTest, ImportDocumentsUpsert) {
                     R"({"id": "5", "points": 60, "cast":["Logan Lerman","Alexandra Daddario"],"starring":"Ron Perlman","starring_facet":"Ron Perlman","title":"Percy Jackson: Sea of Monsters"})",
                     R"({"id": "24", "starring": "John", "cast": ["John Kim"], "points": 11})"};   // missing fields
 
-    import_response = coll_mul_fields->add_many(more_records, document, UPSERT);
+    bool return_id = true;
+    import_response = coll_mul_fields->add_many(more_records, document, UPSERT, "",
+                                                DIRTY_VALUES::COERCE_OR_REJECT, false, return_id);
 
     ASSERT_FALSE(import_response["success"].get<bool>());
     ASSERT_EQ(2, import_response["num_imported"].get<int>());
@@ -1202,6 +1204,11 @@ TEST_F(CollectionTest, ImportDocumentsUpsert) {
     ASSERT_FALSE(import_results[3]["success"].get<bool>());
     ASSERT_STREQ("Field `points` has been declared as a default sorting field, but is not found in the document.", import_results[1]["error"].get<std::string>().c_str());
     ASSERT_STREQ("Field `title` has been declared in the schema, but is not found in the document.", import_results[3]["error"].get<std::string>().c_str());
+
+    ASSERT_EQ("1", import_results[0]["id"].get<std::string>());
+    ASSERT_EQ("90", import_results[1]["id"].get<std::string>());
+    ASSERT_EQ("5", import_results[2]["id"].get<std::string>());
+    ASSERT_EQ("24", import_results[3]["id"].get<std::string>());
 
     // try to duplicate records without upsert option
 
@@ -3065,16 +3072,24 @@ TEST_F(CollectionTest, WildcardQueryReturnsResultsBasedOnPerPageParam) {
     ASSERT_EQ(25, results["found"].get<int>());
 
     // enforce limit_hits
-    res_op = collection->search("*", query_fields, "", facets, sort_fields, {0}, 10, 3,
+    auto limit_hits = 20;
+    results = collection->search("*", query_fields, "", facets, sort_fields, {0}, 10, 3,
                                  FREQUENCY, {false}, 1000,
                                  spp::sparse_hash_set<std::string>(),
                                  spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 40, {}, {}, {}, 0,
-                                 "<mark>", "</mark>", {1}, 20);
+                                 "<mark>", "</mark>", {1}, limit_hits).get();
 
-    ASSERT_FALSE(res_op.ok());
-    ASSERT_STREQ(
-            "Only upto 20 hits can be fetched. Ensure that `page` and `per_page` parameters are within this range.",
-            res_op.error().c_str());
+    ASSERT_EQ(0, results["hits"].size());
+    ASSERT_EQ(25, results["found"].get<int>());
+
+    results = collection->search("*", query_fields, "", facets, sort_fields, {0}, 15, 2,
+                                 FREQUENCY, {false}, 1000,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 40, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {1}, limit_hits).get();
+
+    ASSERT_EQ(5, results["hits"].size());
+    ASSERT_EQ(25, results["found"].get<int>());
 }
 
 TEST_F(CollectionTest, RemoveIfFound) {
@@ -4258,12 +4273,12 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
         coll1 = collectionManager.create_collection("coll1", 1, fields, "points").get();
     }
 
-    std::vector<std::string> q_include_tokens;
+    std::vector<std::string> q_include_tokens, q_unstemmed_tokens;
     std::vector<std::vector<std::string>> q_exclude_tokens;
     std::vector<std::vector<std::string>> q_phrases;
 
     std::string q = R"(the "phrase search" query)";
-    /*coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    /*coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
 
     ASSERT_EQ(2, q_include_tokens.size());
     ASSERT_EQ("the", q_include_tokens[0]);
@@ -4278,9 +4293,10 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q = R"("space padded " query)";
     q_include_tokens.clear();
     q_exclude_tokens.clear();
+    q_unstemmed_tokens.clear();
     q_phrases.clear();
 
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("query", q_include_tokens[0]);
     ASSERT_EQ(1, q_phrases.size());
@@ -4295,7 +4311,7 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q_exclude_tokens.clear();
     q_phrases.clear();
 
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("*", q_include_tokens[0]);
     ASSERT_EQ(2, q_phrases.size());
@@ -4312,7 +4328,7 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q_exclude_tokens.clear();
     q_phrases.clear();
 
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("*", q_include_tokens[0]);
     ASSERT_EQ(1, q_phrases.size());
@@ -4326,7 +4342,7 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q_exclude_tokens.clear();
     q_phrases.clear();
 
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("hello", q_include_tokens[0]);
     ASSERT_EQ(0, q_phrases.size());
@@ -4337,7 +4353,7 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q_exclude_tokens.clear();
     q_phrases.clear();
 
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("here", q_include_tokens[0]);
     ASSERT_EQ(1, q_phrases.size());
@@ -4350,7 +4366,7 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q_include_tokens.clear();
     q_exclude_tokens.clear();
     q_phrases.clear();
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("here", q_include_tokens[0]);
     ASSERT_EQ(0, q_phrases.size());
@@ -4364,7 +4380,7 @@ TEST_F(CollectionTest, QueryParsingForPhraseSearch) {
     q_include_tokens.clear();
     q_exclude_tokens.clear();
     q_phrases.clear();
-    coll1->parse_search_query(q, q_include_tokens, q_exclude_tokens, q_phrases, "en", false);
+    coll1->parse_search_query(q, q_include_tokens, q_unstemmed_tokens, q_exclude_tokens, q_phrases, "en", false);
     ASSERT_EQ(1, q_include_tokens.size());
     ASSERT_EQ("here", q_include_tokens[0]);
     ASSERT_EQ(0, q_phrases.size());

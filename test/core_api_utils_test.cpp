@@ -29,7 +29,32 @@ protected:
         collectionManager.load(8, 1000);
 
         ConversationModelManager::init(store);
-        ConversationManager::get_instance().init(store);
+        nlohmann::json schema_json = R"({
+            "name": "conversation_store",
+            "fields": [
+                {
+                    "name": "conversation_id",
+                    "type": "string"
+                },
+                {
+                    "name": "role",
+                    "type": "string",
+                    "index": false
+                },
+                {
+                    "name": "message",
+                    "type": "string",
+                    "index": false
+                },
+                {
+                    "name": "timestamp",
+                    "type": "int32",
+                    "sort": true
+                }
+            ]
+        })"_json;
+
+        collectionManager.create_collection(schema_json);
     }
 
     virtual void SetUp() {
@@ -870,12 +895,7 @@ TEST_F(CoreAPIUtilsTest, ExportWithFilter) {
 
     export_state_t export_state;
     filter_result_t filter_result;
-    coll1->get_filter_ids("points:>=0", filter_result);
-    export_state.index_ids.emplace_back(filter_result.count, filter_result.docs);
-    filter_result.docs = nullptr;
-    for(size_t i=0; i<export_state.index_ids.size(); i++) {
-        export_state.offsets.push_back(0);
-    }
+    coll1->get_filter_ids("points:>=0", export_state.filter_result);
 
     export_state.collection = coll1;
     export_state.res_body = &res_body;
@@ -888,6 +908,178 @@ TEST_F(CoreAPIUtilsTest, ExportWithFilter) {
     stateful_export_docs(&export_state, 2, done);
     ASSERT_TRUE(done);
     ASSERT_EQ('}', export_state.res_body->back());
+}
+
+TEST_F(CoreAPIUtilsTest, ExportWithJoin) {
+    auto schema_json =
+            R"({
+                "name": "Products",
+                "fields": [
+                    {"name": "product_id", "type": "string"},
+                    {"name": "product_name", "type": "string"},
+                    {"name": "product_description", "type": "string"},
+                    {"name": "rating", "type": "int32"}
+                ]
+            })"_json;
+    std::vector<nlohmann::json> documents = {
+            R"({
+                "product_id": "product_a",
+                "product_name": "shampoo",
+                "product_description": "Our new moisturizing shampoo is perfect for those with dry or damaged hair.",
+                "rating": "2"
+            })"_json,
+            R"({
+                "product_id": "product_b",
+                "product_name": "soap",
+                "product_description": "Introducing our all-natural, organic soap bar made with essential oils and botanical ingredients.",
+                "rating": "4"
+            })"_json
+    };
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    for (auto const &json: documents) {
+        auto add_op = collection_create_op.get()->add(json.dump());
+        if (!add_op.ok()) {
+            LOG(INFO) << add_op.error();
+        }
+        ASSERT_TRUE(add_op.ok());
+    }
+
+    schema_json =
+            R"({
+                "name": "Customers",
+                "fields": [
+                    {"name": "customer_id", "type": "string"},
+                    {"name": "customer_name", "type": "string"},
+                    {"name": "product_price", "type": "float"},
+                    {"name": "product_id", "type": "string", "reference": "Products.product_id"}
+                ]
+            })"_json;
+    documents = {
+            R"({
+                "customer_id": "customer_a",
+                "customer_name": "Joe",
+                "product_price": 143,
+                "product_id": "product_a"
+            })"_json,
+            R"({
+                "customer_id": "customer_a",
+                "customer_name": "Joe",
+                "product_price": 73.5,
+                "product_id": "product_b"
+            })"_json,
+            R"({
+                "customer_id": "customer_b",
+                "customer_name": "Dan",
+                "product_price": 75,
+                "product_id": "product_a"
+            })"_json,
+            R"({
+                "customer_id": "customer_b",
+                "customer_name": "Dan",
+                "product_price": 140,
+                "product_id": "product_b"
+            })"_json
+    };
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    for (auto const &json: documents) {
+        auto add_op = collection_create_op.get()->add(json.dump());
+        if (!add_op.ok()) {
+            LOG(INFO) << add_op.error();
+        }
+        ASSERT_TRUE(add_op.ok());
+    }
+
+    schema_json =
+            R"({
+                "name": "Dummy",
+                "fields": [
+                    {"name": "dummy_id", "type": "string"}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+
+    bool done;
+    std::string res_body;
+
+    export_state_t export_state;
+    auto coll1 = collectionManager.get_collection_unsafe("Products");
+    coll1->get_filter_ids("$Customers(customer_id:customer_a)", export_state.filter_result);
+    export_state.collection = coll1;
+    export_state.res_body = &res_body;
+    export_state.include_fields.insert("product_name");
+    export_state.ref_include_exclude_fields_vec.emplace_back(ref_include_exclude_fields{"Customers", {"product_price"}, "",
+                                                                                        "", ref_include::nest});
+
+    stateful_export_docs(&export_state, 1, done);
+    ASSERT_FALSE(done);
+    ASSERT_EQ('\n', export_state.res_body->back());
+    auto doc = nlohmann::json::parse(export_state.res_body->c_str());
+    ASSERT_EQ("shampoo", doc["product_name"]);
+    ASSERT_EQ(143, doc["Customers"]["product_price"]);
+
+    // should not have trailing newline character for the last line
+    stateful_export_docs(&export_state, 1, done);
+    ASSERT_TRUE(done);
+    ASSERT_EQ('}', export_state.res_body->back());
+    doc = nlohmann::json::parse(export_state.res_body->c_str());
+    ASSERT_EQ("soap", doc["product_name"]);
+    ASSERT_EQ(73.5, doc["Customers"]["product_price"]);
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+    req->params["collection"] = "Products";
+    req->params["q"] = "*";
+    req->params["filter_by"] = "$Customers(customer_id: customer_a)";
+
+    get_export_documents(req, res);
+
+    std::vector<std::string> res_strs;
+    StringUtils::split(res->body, res_strs, "\n");
+
+    doc = nlohmann::json::parse(res_strs[0]);
+    ASSERT_EQ(6, doc.size());
+    ASSERT_EQ(1, doc.count("product_name"));
+    ASSERT_EQ("shampoo", doc["product_name"]);
+    ASSERT_EQ(1, doc.count("Customers"));
+    ASSERT_EQ(5, doc["Customers"].size());
+    ASSERT_EQ(1, doc["Customers"].count("product_price"));
+    ASSERT_EQ(143, doc["Customers"]["product_price"]);
+
+    doc = nlohmann::json::parse(res_strs[1]);
+    ASSERT_EQ(6, doc.size());
+    ASSERT_EQ(1, doc.count("product_name"));
+    ASSERT_EQ("soap", doc["product_name"]);
+    ASSERT_EQ(1, doc.count("Customers"));
+    ASSERT_EQ(5, doc["Customers"].size());
+    ASSERT_EQ(1, doc["Customers"].count("product_price"));
+    ASSERT_EQ(73.5, doc["Customers"]["product_price"]);
+
+    delete dynamic_cast<export_state_t*>(req->data);
+    req->data = nullptr;
+    res->body.clear();
+    req->params["filter_by"] = "rating: >2 && (id:* || $Customers(id:*))";
+    req->params["include_fields"] = "$Customers(*,strategy:nest_array) as Customers";
+
+    get_export_documents(req, res);
+
+    res_strs.clear();
+    StringUtils::split(res->body, res_strs, "\n");
+
+    doc = nlohmann::json::parse(res_strs[0]);
+    ASSERT_EQ(6, doc.size());
+    ASSERT_EQ(1, doc.count("product_name"));
+    ASSERT_EQ("soap", doc["product_name"]);
+    ASSERT_EQ(1, doc.count("Customers"));
+    ASSERT_EQ(2, doc["Customers"].size());
+    ASSERT_EQ(5, doc["Customers"][0].size());
+    ASSERT_EQ("customer_a", doc["Customers"][0]["customer_id"]);
+    ASSERT_EQ(73.5, doc["Customers"][0]["product_price"]);
+    ASSERT_EQ(5, doc["Customers"][1].size());
+    ASSERT_EQ("customer_b", doc["Customers"][1]["customer_id"]);
+    ASSERT_EQ(140, doc["Customers"][1]["product_price"]);
 }
 
 TEST_F(CoreAPIUtilsTest, TestParseAPIKeyIPFromMetadata) {
@@ -947,7 +1139,8 @@ TEST_F(CoreAPIUtilsTest, ExportIncludeExcludeFields) {
 
     auto doc1 = R"({
         "name": {"first": "John", "last": "Smith"},
-        "points": 100
+        "points": 100,
+        "description": "description"
     })"_json;
 
     auto add_op = coll1->add(doc1.dump(), CREATE);
@@ -982,11 +1175,32 @@ TEST_F(CoreAPIUtilsTest, ExportIncludeExcludeFields) {
     res_strs.clear();
     StringUtils::split(res->body, res_strs, "\n");
     doc = nlohmann::json::parse(res_strs[0]);
-    ASSERT_EQ(3, doc.size());
+    ASSERT_EQ(4, doc.size());
     ASSERT_EQ(1, doc.count("id"));
     ASSERT_EQ(1, doc.count("points"));
     ASSERT_EQ(1, doc.count("name"));
     ASSERT_EQ(1, doc["name"].count("first"));
+    ASSERT_EQ(1, doc.count("description"));     // field not in schema is exported
+
+    // no include or exclude fields
+
+    delete dynamic_cast<export_state_t*>(req->data);
+    req->data = nullptr;
+    res->body.clear();
+    req->params.erase("include_fields");
+    req->params.erase("exclude_fields");
+    get_export_documents(req, res);
+
+    res_strs.clear();
+    StringUtils::split(res->body, res_strs, "\n");
+    doc = nlohmann::json::parse(res_strs[0]);
+    ASSERT_EQ(4, doc.size());
+    ASSERT_EQ(1, doc.count("id"));
+    ASSERT_EQ(1, doc.count("points"));
+    ASSERT_EQ(1, doc.count("name"));
+    ASSERT_EQ(1, doc["name"].count("first"));
+    ASSERT_EQ(1, doc["name"].count("last"));
+    ASSERT_EQ(1, doc.count("description"));     // field not in schema is exported
 
     collectionManager.drop_collection("coll1");
 }
@@ -1202,20 +1416,6 @@ TEST_F(CoreAPIUtilsTest, TestGetConversations) {
     auto req = std::make_shared<http_req>();
     auto resp = std::make_shared<http_res>(nullptr);
 
-    req->params["id"] = "0";
-
-    get_conversations(req, resp);
-
-    ASSERT_EQ(200, resp->status_code);
-
-    nlohmann::json res_json = nlohmann::json::parse(resp->body);
-    ASSERT_TRUE(res_json.is_array());
-    ASSERT_EQ(0, res_json.size());
-
-    get_conversation(req, resp);
-
-    ASSERT_EQ(404, resp->status_code);
-
     auto schema_json =
         R"({
         "name": "Products",
@@ -1275,59 +1475,30 @@ TEST_F(CoreAPIUtilsTest, TestGetConversations) {
 
     model_config["api_key"] = api_key;
 
-    auto add_model_op = ConversationModelManager::add_model(model_config);
+    auto add_model_op = ConversationModelManager::add_model(model_config, "", true);
 
     ASSERT_TRUE(add_model_op.ok());
 
-    LOG(INFO) << "Model id: " << add_model_op.get();
+    LOG(INFO) << "Model id: " << model_config["id"];
 
-    auto model_id = add_model_op.get()["id"].get<std::string>();
+    auto model_id = model_config["id"].get<std::string>();
 
     auto results_op = coll->search("how many products are there for clothing category?", {"embedding"},
                                  "", {}, {}, {2}, 10,
                                  1, FREQUENCY, {true},
-                                 0, spp::sparse_hash_set<std::string>(), {},
+                                 0, spp::sparse_hash_set<std::string>(), spp::sparse_hash_set<std::string>(),
                                  10, "", 30, 4, "", 1, "", "", {}, 3, "<mark>", "</mark>", {}, 4294967295UL, true, false,
                                  true, "", false, 6000000UL, 4, 7, fallback, 4, {off}, 32767UL, 32767UL, 2, 2, false, "",
-                                 true, 0, max_score, 100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, true, true, model_id);
+                                 true, 0, max_score, 100, 0, 0, "exhaustive", 30000, 2, "", {}, {}, "right_to_left", true, true, true, model_id);
     
     ASSERT_TRUE(results_op.ok());
 
-    get_conversations(req, resp);
+    auto id = results_op.get()["conversation"]["id"].get<std::string>();
 
-    ASSERT_EQ(200, resp->status_code);
-
-    res_json = nlohmann::json::parse(resp->body);
-
-    ASSERT_TRUE(res_json.is_array());
-    ASSERT_EQ(1, res_json.size());
-
-    ASSERT_TRUE(res_json[0]["conversation"].is_array());
-    ASSERT_EQ(2, res_json[0]["conversation"].size());
-    ASSERT_EQ("how many products are there for clothing category?", res_json[0]["conversation"][0]["user"].get<std::string>());
-
-    req->params["id"] = res_json[0]["id"].get<std::string>();
-    get_conversation(req, resp);
-
-    ASSERT_EQ(200, resp->status_code);
-
-    res_json = nlohmann::json::parse(resp->body);
-
-    ASSERT_TRUE(res_json.is_object());
-    ASSERT_TRUE(res_json["conversation"].is_array());
-    ASSERT_EQ(2, res_json["conversation"].size());
-    ASSERT_EQ("how many products are there for clothing category?", res_json["conversation"][0]["user"].get<std::string>());
-
-    del_conversation(req, resp);
-    ASSERT_EQ(200, resp->status_code);
-
-    get_conversations(req, resp);
-    ASSERT_EQ(200, resp->status_code);
-
-    res_json = nlohmann::json::parse(resp->body);
-    ASSERT_TRUE(res_json.is_array());
-    ASSERT_EQ(0, res_json.size());
-
+    auto history_collection = ConversationManager::get_instance()
+            .get_history_collection(model_config["history_collection"].get<std::string>()).get();
+    auto history_search_res = history_collection->search(id, {"conversation_id"}, "", {}, {}, {0}).get();
+    ASSERT_EQ(2, history_search_res["hits"].size());
     auto del_res = ConversationModelManager::delete_model(model_id);
 }
 
@@ -1389,7 +1560,8 @@ TEST_F(CoreAPIUtilsTest, SampleGzipIndexTest) {
 TEST_F(CoreAPIUtilsTest, TestConversationModels) {
     nlohmann::json model_config = R"({
         "model_name": "openai/gpt-3.5-turbo",
-        "max_bytes": 10000
+        "max_bytes": 10000,
+        "history_collection": "conversation_store"
     })"_json;
 
     EmbedderManager::set_model_dir("/tmp/typesense_test/models");
@@ -1430,6 +1602,7 @@ TEST_F(CoreAPIUtilsTest, TestConversationModels) {
 TEST_F(CoreAPIUtilsTest, TestInvalidConversationModels) {
     // test with no model_name
     nlohmann::json model_config = R"({
+        "history_collection": "conversation_store"
     })"_json;
 
     if (std::getenv("api_key") == nullptr) {
@@ -1517,6 +1690,25 @@ TEST_F(CoreAPIUtilsTest, TestInvalidConversationModels) {
 
     ASSERT_EQ(400, resp->status_code);
     ASSERT_EQ("Property `max_bytes` must be a positive number.", nlohmann::json::parse(resp->body)["message"]);
+
+    model_config["max_bytes"] = 10000;
+    model_config["history_collection"] = 123;
+
+    // test with history_collection as integer
+    req->body = model_config.dump();
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Property `history_collection` is not provided or not a string.", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with history_collection as empty string
+    model_config["history_collection"] = "";
+
+    req->body = model_config.dump();
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Collection not found", nlohmann::json::parse(resp->body)["message"]);
 }
 
 TEST_F(CoreAPIUtilsTest, DeleteNonExistingDoc) {
@@ -1598,6 +1790,7 @@ TEST_F(CoreAPIUtilsTest, CollectionsPagination) {
               "optional":false,
               "sort":false,
               "stem":false,
+              "store": true,
               "type":"string"
             }
           ],
@@ -1737,7 +1930,7 @@ TEST_F(CoreAPIUtilsTest, SynonymsPagination) {
     nlohmann::json expected_json = R"({
         "synonyms":[
                     {
-                        "id":"foobar4",
+                        "id":"foobar1",
                         "root":"",
                         "synonyms":["blazer","suit"]
                     }]
@@ -1758,4 +1951,428 @@ TEST_F(CoreAPIUtilsTest, SynonymsPagination) {
     get_collections(req, resp);
     ASSERT_EQ(400, resp->status_code);
     ASSERT_EQ("{\"message\": \"Limit param should be unsigned integer.\"}", resp->body);
+}
+
+
+TEST_F(CoreAPIUtilsTest, CollectionMetadataUpdate) {
+    CollectionManager & collectionManager3 = CollectionManager::get_instance();
+
+    nlohmann::json schema = R"({
+        "name": "collection_meta",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "value.color", "type": "string", "optional": false, "facet": true },
+          {"name": "value.r", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.g", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.b", "type": "int32", "optional": false, "facet": true }
+        ],
+        "metadata": {
+            "batch_job":"",
+            "indexed_from":"2023-04-20T00:00:00.000Z",
+            "total_docs": 0
+        }
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    std::string collection_meta_json;
+    nlohmann::json collection_meta;
+    std::string next_seq_id;
+    std::string next_collection_id;
+
+    store->get(Collection::get_meta_key("collection_meta"), collection_meta_json);
+
+    nlohmann::json expected_meta_json = R"(
+        {
+            "created_at":1705482381,
+            "default_sorting_field":"",
+            "enable_nested_fields":true,
+            "fallback_field_type":"",
+            "fields":[
+                {
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.color",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":false,
+                    "store":true,
+                    "type":"string",
+                    "range_index":false,
+                    "stem":false
+                },
+                {
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.r",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                },{
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.g",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                },{
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.b",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                }
+            ],
+            "id":1,
+            "metadata":{
+                "batch_job":"",
+                "indexed_from":"2023-04-20T00:00:00.000Z",
+                "total_docs":0
+            },
+            "name":"collection_meta",
+            "num_memory_shards":4,
+            "symbols_to_index":[],
+            "token_separators":[]
+    })"_json;
+
+    auto actual_json = nlohmann::json::parse(collection_meta_json);
+    expected_meta_json["created_at"] = actual_json["created_at"];
+
+    ASSERT_EQ(expected_meta_json.dump(), actual_json.dump());
+
+    //try setting empty metadata
+    auto metadata = R"({
+        "metadata": {}
+    })"_json;
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "collection_meta";
+    req->body = metadata.dump();
+    patch_update_collection(req, res);
+
+    expected_meta_json = R"(
+        {
+            "created_at":1705482381,
+            "default_sorting_field":"",
+            "enable_nested_fields":true,
+            "fallback_field_type":"",
+            "fields":[
+                {
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.color",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":false,
+                    "store":true,
+                    "type":"string",
+                    "range_index":false,
+                    "stem":false
+                },
+                {
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.r",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                },{
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.g",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                },{
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.b",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                }
+            ],
+            "id":1,
+            "metadata":{
+            },
+            "name":"collection_meta",
+            "num_memory_shards":4,
+            "symbols_to_index":[],
+            "token_separators":[]
+    })"_json;
+
+    store->get(Collection::get_meta_key("collection_meta"), collection_meta_json);
+    actual_json = nlohmann::json::parse(collection_meta_json);
+    expected_meta_json["created_at"] = actual_json["created_at"];
+    ASSERT_EQ(expected_meta_json.dump(), actual_json.dump());
+}
+
+TEST_F(CoreAPIUtilsTest, CollectionUpdateValidation) {
+    CollectionManager & collectionManager3 = CollectionManager::get_instance();
+
+    nlohmann::json schema = R"({
+        "name": "collection_meta",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "value.color", "type": "string", "optional": false, "facet": true },
+          {"name": "value.r", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.g", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.b", "type": "int32", "optional": false, "facet": true }
+        ],
+        "metadata": {
+            "batch_job":"",
+            "indexed_from":"2023-04-20T00:00:00.000Z",
+            "total_docs": 0
+        }
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto alter_schema = R"({
+        "metadata": {},
+        "fields":[
+            {"name": "value.color", "drop": true },
+           {"name": "value.color", "type": "string", "facet": true }
+        ]
+    })"_json;
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "collection_meta";
+    req->body = alter_schema.dump();
+
+    ASSERT_TRUE(patch_update_collection(req, res));
+
+    alter_schema = R"({
+        "metadata": {},
+        "symbols_to_index":[]
+    })"_json;
+
+    req->body = alter_schema.dump();
+    ASSERT_FALSE(patch_update_collection(req, res));
+    ASSERT_EQ("{\"message\": \"Only `fields` and `metadata` can be updated at the moment.\"}", res->body);
+
+    alter_schema = R"({
+        "symbols_to_index":[]
+    })"_json;
+
+    req->body = alter_schema.dump();
+    ASSERT_FALSE(patch_update_collection(req, res));
+    ASSERT_EQ("{\"message\": \"Only `fields` and `metadata` can be updated at the moment.\"}", res->body);
+
+    alter_schema = R"({
+        "name": "collection_meta2",
+        "metadata": {},
+        "fields":[
+            {"name": "value.hue", "type": "int32", "optional": false, "facet": true }
+        ]
+    })"_json;
+
+    req->body = alter_schema.dump();
+    ASSERT_FALSE(patch_update_collection(req, res));
+    ASSERT_EQ("{\"message\": \"Only `fields` and `metadata` can be updated at the moment.\"}", res->body);
+
+    alter_schema = R"({
+    })"_json;
+
+    req->body = alter_schema.dump();
+    ASSERT_FALSE(patch_update_collection(req, res));
+    ASSERT_EQ("{\"message\": \"Alter payload is empty.\"}", res->body);
+}
+
+TEST_F(CoreAPIUtilsTest, DocumentGetIncludeExcludeFields) {
+    std::vector<field> fields = {
+            field("title", field_types::STRING, false),
+            field("brand", field_types::STRING, true, true),
+            field("size", field_types::INT32, true, false),
+            field("colors", field_types::STRING_ARRAY, true, false),
+            field("rating", field_types::FLOAT, true, false)
+    };
+
+    auto coll1 = collectionManager.get_collection("coll1").get();
+    if(coll1 == nullptr) {
+        coll1 = collectionManager.create_collection("coll1", 4, fields, "rating").get();
+    }
+
+    nlohmann::json doc;
+    doc["id"] = "1";
+    doc["title"] = "Denim jeans";
+    doc["brand"] = "Spykar";
+    doc["size"] = 40;
+    doc["colors"] = {"blue", "black", "grey"};
+    doc["rating"] = 4.5;
+    coll1->add(doc.dump());
+
+    doc["id"] = "2";
+    doc["title"] = "Denim jeans";
+    doc["brand"] = "Levis";
+    doc["size"] = 42;
+    doc["colors"] = {"blue", "black"};
+    doc["rating"] = 4.4;
+    coll1->add(doc.dump());
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "coll1";
+    req->params["id"] = "1";
+
+    //normal doc fetch
+    ASSERT_TRUE(get_fetch_document(req, res));
+    auto resp = nlohmann::json::parse(res->body);
+    ASSERT_EQ(6, resp.size());
+    ASSERT_TRUE(resp.contains("brand"));
+    ASSERT_TRUE(resp.contains("size"));
+    ASSERT_TRUE(resp.contains("colors"));
+    ASSERT_TRUE(resp.contains("rating"));
+    ASSERT_TRUE(resp.contains("id"));
+    ASSERT_TRUE(resp.contains("title"));
+
+    //include fields
+    req->params["include_fields"] = "brand,size,colors";
+
+    ASSERT_TRUE(get_fetch_document(req, res));
+    resp = nlohmann::json::parse(res->body);
+    ASSERT_EQ(3, resp.size());
+    ASSERT_TRUE(resp.contains("brand"));
+    ASSERT_TRUE(resp.contains("size"));
+    ASSERT_TRUE(resp.contains("colors"));
+    ASSERT_FALSE(resp.contains("rating"));
+
+    //exclude fields
+    req->params.erase("include_fields");
+    req->params["exclude_fields"] = "brand,size,colors";
+    ASSERT_TRUE(get_fetch_document(req, res));
+    resp = nlohmann::json::parse(res->body);
+    ASSERT_EQ(3, resp.size());
+    ASSERT_TRUE(resp.contains("id"));
+    ASSERT_TRUE(resp.contains("title"));
+    ASSERT_TRUE(resp.contains("rating"));
+    ASSERT_FALSE(resp.contains("brand"));
+
+    //both include and exclude fields
+    req->params["include_fields"] = "title,rating";
+    req->params["exclude_fields"] = "brand,size,colors";
+    ASSERT_TRUE(get_fetch_document(req, res));
+    resp = nlohmann::json::parse(res->body);
+    ASSERT_EQ(2, resp.size());
+    ASSERT_TRUE(resp.contains("title"));
+    ASSERT_TRUE(resp.contains("rating"));
+    ASSERT_FALSE(resp.contains("id"));
+}
+
+TEST_F(CoreAPIUtilsTest, CollectionSchemaResponseWithStoreValue) {
+    auto schema = R"({
+            "name": "collection3",
+            "enable_nested_fields": true,
+            "fields": [
+                {"name": "title", "type": "string", "locale": "en", "store":false},
+                {"name": "points", "type": "int32"}
+            ],
+            "default_sorting_field": "points"
+        })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "collection3";
+    ASSERT_TRUE(get_collection_summary(req, res));
+
+    auto res_json = nlohmann::json::parse(res->body);
+
+    auto expected_json = R"({
+        "default_sorting_field":"points",
+        "enable_nested_fields":true,
+        "fields":[
+                {
+                    "facet":false,
+                    "index":true,
+                    "infix":false,
+                    "locale":"en",
+                    "name":"title",
+                    "optional":false,
+                    "sort":false,
+                    "stem":false,
+                    "store":false,
+                    "type":"string"
+                },
+                {
+                    "facet":false,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"points",
+                    "optional":false,
+                    "sort":true,
+                    "stem":false,
+                    "store":true,
+                    "type":"int32"
+                }],
+                "name":"collection3",
+                "num_documents":0,
+                "symbols_to_index":[],
+                "token_separators":[]
+    })"_json;
+
+    expected_json["created_at"] = res_json["created_at"];
+    ASSERT_EQ(expected_json, res_json);
 }

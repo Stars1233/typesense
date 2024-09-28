@@ -60,6 +60,7 @@ namespace fields {
     static const std::string num_dim = "num_dim";
     static const std::string vec_dist = "vec_dist";
     static const std::string reference = "reference";
+    static const std::string async_reference = "async_reference";
     static const std::string embed = "embed";
     static const std::string from = "from";
     static const std::string model_name = "model_name";
@@ -84,6 +85,14 @@ namespace fields {
 enum vector_distance_type_t {
     ip,
     cosine
+};
+
+struct reference_pair_t {
+    std::string collection;
+    std::string field;
+
+    reference_pair_t(std::string collection, std::string field) : collection(std::move(collection)),
+                                                                  field(std::move(field)) {}
 };
 
 struct field {
@@ -112,6 +121,7 @@ struct field {
     static constexpr int VAL_UNKNOWN = 2;
 
     std::string reference;      // Foo.bar (reference to bar field in Foo collection).
+    bool is_async_reference = false;
 
     bool range_index;
 
@@ -127,10 +137,13 @@ struct field {
     field(const std::string &name, const std::string &type, const bool facet, const bool optional = false,
           bool index = true, std::string locale = "", int sort = -1, int infix = -1, bool nested = false,
           int nested_array = 0, size_t num_dim = 0, vector_distance_type_t vec_dist = cosine,
-          std::string reference = "", const nlohmann::json& embed = nlohmann::json(), const bool range_index = false, const bool store = true, const bool stem = false, const nlohmann::json hnsw_params = nlohmann::json()) :
+          std::string reference = "", const nlohmann::json& embed = nlohmann::json(), const bool range_index = false,
+          const bool store = true, const bool stem = false, const nlohmann::json hnsw_params = nlohmann::json(),
+          const bool async_reference = false) :
             name(name), type(type), facet(facet), optional(optional), index(index), locale(locale),
             nested(nested), nested_array(nested_array), num_dim(num_dim), vec_dist(vec_dist), reference(reference),
-            embed(embed), range_index(range_index), store(store), stem(stem), hnsw_params(hnsw_params) {
+            embed(embed), range_index(range_index), store(store), stem(stem), hnsw_params(hnsw_params),
+            is_async_reference(async_reference) {
 
         set_computed_defaults(sort, infix);
 
@@ -339,128 +352,7 @@ struct field {
 
     static Option<bool> fields_to_json_fields(const std::vector<field> & fields,
                                               const std::string & default_sorting_field,
-                                              nlohmann::json& fields_json) {
-        bool found_default_sorting_field = false;
-
-        // Check for duplicates in field names
-        std::map<std::string, std::vector<const field*>> unique_fields;
-
-        for(const field & field: fields) {
-            unique_fields[field.name].push_back(&field);
-
-            if(field.name == "id") {
-                continue;
-            }
-
-            nlohmann::json field_val;
-            field_val[fields::name] = field.name;
-            field_val[fields::type] = field.type;
-            field_val[fields::facet] = field.facet;
-            field_val[fields::optional] = field.optional;
-            field_val[fields::index] = field.index;
-            field_val[fields::sort] = field.sort;
-            field_val[fields::infix] = field.infix;
-
-            field_val[fields::locale] = field.locale;
-
-            field_val[fields::store] = field.store;
-            
-            if(field.embed.count(fields::from) != 0) {
-                field_val[fields::embed] = field.embed;
-            }
-
-            field_val[fields::nested] = field.nested;
-            if(field.nested) {
-                field_val[fields::nested_array] = field.nested_array;
-            }
-
-            if(field.num_dim > 0) {
-                field_val[fields::num_dim] = field.num_dim;
-                field_val[fields::vec_dist] = field.vec_dist == ip ? "ip" : "cosine";
-            }
-
-            if (!field.reference.empty()) {
-                field_val[fields::reference] = field.reference;
-            }
-
-            fields_json.push_back(field_val);
-
-            if(!field.has_valid_type()) {
-                return Option<bool>(400, "Field `" + field.name +
-                                         "` has an invalid data type `" + field.type +
-                                         "`, see docs for supported data types.");
-            }
-
-            if(field.name == default_sorting_field && !field.is_sortable()) {
-                return Option<bool>(400, "Default sorting field `" + default_sorting_field +
-                                         "` is not a sortable type.");
-            }
-
-            if(field.name == default_sorting_field) {
-                if(field.optional) {
-                    return Option<bool>(400, "Default sorting field `" + default_sorting_field +
-                                             "` cannot be an optional field.");
-                }
-
-                if(field.is_geopoint()) {
-                    return Option<bool>(400, "Default sorting field cannot be of type geopoint.");
-                }
-
-                found_default_sorting_field = true;
-            }
-
-            if(field.is_dynamic() && !field.nested && !field.optional) {
-                return Option<bool>(400, "Field `" + field.name + "` must be an optional field.");
-            }
-
-            if(field.name == ".*" && !field.index) {
-                return Option<bool>(400, "Field `" + field.name + "` cannot be marked as non-indexable.");
-            }
-
-            if(!field.index && field.facet) {
-                return Option<bool>(400, "Field `" + field.name + "` cannot be a facet since "
-                                                                  "it's marked as non-indexable.");
-            }
-
-            if(!field.is_sort_field() && field.sort) {
-                return Option<bool>(400, "Field `" + field.name + "` cannot be a sortable field.");
-            }
-        }
-
-        if(!default_sorting_field.empty() && !found_default_sorting_field) {
-            return Option<bool>(400, "Default sorting field is defined as `" + default_sorting_field +
-                                     "` but is not found in the schema.");
-        }
-
-        // check for duplicate field names in schema
-        for(auto& fname_fields: unique_fields) {
-            if(fname_fields.second.size() > 1) {
-                // if there are more than 1 field with the same field name, then
-                // a) only 1 field can be of static type
-                // b) only 1 field can be of dynamic type
-                size_t num_static = 0;
-                size_t num_dynamic = 0;
-
-                for(const field* f: fname_fields.second) {
-                    if(f->name == ".*" || f->is_dynamic()) {
-                        num_dynamic++;
-                    } else {
-                        num_static++;
-                    }
-                }
-
-                if(num_static != 0 && num_static > 1) {
-                    return Option<bool>(400, "There are duplicate field names in the schema.");
-                }
-
-                if(num_dynamic != 0 && num_dynamic > 1) {
-                    return Option<bool>(400, "There are duplicate field names in the schema.");
-                }
-            }
-        }
-
-        return Option<bool>(true);
-    }
+                                              nlohmann::json& fields_json);
 
     static Option<bool> json_field_to_field(bool enable_nested_fields, nlohmann::json& field_json,
                                             std::vector<field>& the_fields,
@@ -578,7 +470,7 @@ struct sort_by {
     };
 
     struct eval_t {
-        filter_node_t* filter_trees = nullptr;
+        filter_node_t** filter_trees = nullptr; // Array of filter_node_t pointers.
         std::vector<uint32_t*> eval_ids_vec;
         std::vector<uint32_t> eval_ids_count_vec;
         std::vector<int64_t> scores;
@@ -600,6 +492,7 @@ struct sort_by {
     eval_t eval;
 
     std::string reference_collection_name;
+    std::vector<std::string> nested_join_collection_names;
     sort_vector_query_t vector_query;
 
     sort_by(const std::string & name, const std::string & order):
@@ -634,10 +527,15 @@ struct sort_by {
         missing_values = other.missing_values;
         eval = other.eval;
         reference_collection_name = other.reference_collection_name;
+        nested_join_collection_names = other.nested_join_collection_names;
         vector_query = other.vector_query;
     }
 
     sort_by& operator=(const sort_by& other) {
+        if (&other == this) {
+            return *this;
+        }
+
         name = other.name;
         eval_expressions = other.eval_expressions;
         order = other.order;
@@ -648,7 +546,12 @@ struct sort_by {
         missing_values = other.missing_values;
         eval = other.eval;
         reference_collection_name = other.reference_collection_name;
+        nested_join_collection_names = other.nested_join_collection_names;
         return *this;
+    }
+
+    [[nodiscard]] inline bool is_nested_join_sort_by() const {
+        return !nested_join_collection_names.empty();
     }
 };
 
